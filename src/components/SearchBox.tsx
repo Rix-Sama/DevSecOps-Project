@@ -31,7 +31,7 @@ const StyledInputBase = styled(InputBase)(({ theme }) => ({
       width: "auto",
     },
   },
-}));
+}))
 
 export default function SearchBox() {
   const [isFocused, setIsFocused] = useState(false);
