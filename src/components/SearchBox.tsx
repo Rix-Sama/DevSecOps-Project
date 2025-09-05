@@ -35,7 +35,6 @@ const StyledInputBase = styled(InputBase)(({ theme }) => ({
 
 export default function SearchBox() {
   const [isFocused, setIsFocused] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
   const searchInputRef = useRef<HTMLInputElement>();
 
   const handleClickSearchIcon = () => {
@@ -56,8 +55,6 @@ export default function SearchBox() {
       <StyledInputBase
         inputRef={searchInputRef}
         placeholder="Titles, people, genres"
-        value={searchQuery}
-        onChange={(e) => setSearchQuery(e.target.value)}
         inputProps={{
           "aria-label": "search",
           onFocus: () => {
@@ -68,25 +65,6 @@ export default function SearchBox() {
           },
         }}
       />
-      {/* 🚨 VULNÉRABILITÉ XSS: Affichage non sécurisé de l'entrée utilisateur */}
-      {searchQuery && (
-        <div 
-          style={{ 
-            position: 'absolute', 
-            top: '100%', 
-            left: 0, 
-            right: 0, 
-            background: 'white', 
-            color: 'black', 
-            padding: '8px',
-            zIndex: 1000,
-            fontSize: '12px'
-          }}
-          dangerouslySetInnerHTML={{ 
-            __html: `Recherche: <strong>${searchQuery}</strong>` 
-          }} 
-        />
-      )}
     </Search>
   );
 }
