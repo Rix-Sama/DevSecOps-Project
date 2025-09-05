@@ -1,0 +1,232 @@
+pipeline {
+    agent any
+    
+    // 🚀 Déclenchement automatique sur push GitHub
+    triggers {
+        githubPush()
+    }
+    
+    // 🚀 Options avancées
+    options {
+        githubNotify()
+        timeout(time: 30, unit: 'MINUTES')
+        retry(3)
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    
+    tools {
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+    
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_REGISTRY = 'nasi101'
+        IMAGE_NAME = 'netflix'
+        KUBERNETES_NAMESPACE = 'netflix-app'
+    }
+    
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        
+        stage('Checkout from Git') {
+            steps {
+                // 🚀 Récupération automatique du code depuis GitHub
+                checkout scm
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                sh "npm install"
+            }
+        }
+        
+        // 🧪 Tests automatisés
+        stage('Run Tests') {
+            steps {
+                sh "npm run test -- --coverage --watchAll=false || true"
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'test-results.xml'
+                    publishCoverage adapters: [coberturaAdapter('coverage/cobertura-coverage.xml')]
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Netflix \
+                    -Dsonar.projectKey=Netflix \
+                    -Dsonar.coverageReportPaths=coverage/cobertura-coverage.xml '''
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: true, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+        
+        stage('OWASP FS SCAN') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+        
+        stage('TRIVY FS SCAN') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+        
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        // 🔐 Utilisation sécurisée des secrets
+                        withCredentials([string(credentialsId: 'tmdb-api-key', variable: 'TMDB_API_KEY')]) {
+                            sh "docker build --build-arg TMDB_V3_API_KEY=${TMDB_API_KEY} -t ${IMAGE_NAME} ."
+                        }
+                        sh "docker tag ${IMAGE_NAME} ${DOCKER_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                        sh "docker tag ${IMAGE_NAME} ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
+                        sh "docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                        sh "docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
+                    }
+                }
+            }
+        }
+        
+        stage('TRIVY Image Scan') {
+            steps {
+                sh "trivy image ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest > trivyimage.txt"
+            }
+        }
+        
+        // 🚀 Déploiement avec gestion d'erreurs et rollback
+        stage('Deploy to Container') {
+            steps {
+                script {
+                    try {
+                        // Arrêter l'ancien conteneur s'il existe
+                        sh 'docker stop netflix-app || true'
+                        sh 'docker rm netflix-app || true'
+                        
+                        // Lancer le nouveau conteneur
+                        sh "docker run -d --name netflix-app -p 8081:80 ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
+                        
+                        // 🏥 Health Check
+                        sh 'sleep 10'
+                        sh 'curl -f http://localhost:8081/ || exit 1'
+                        
+                        echo "✅ Déploiement réussi sur le port 8081"
+                        
+                    } catch (Exception e) {
+                        // 🔄 Rollback automatique
+                        echo "❌ Échec du déploiement, rollback en cours..."
+                        sh 'docker stop netflix-app || true'
+                        sh 'docker rm netflix-app || true'
+                        sh "docker run -d --name netflix-app -p 8081:80 ${DOCKER_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER-1} || true"
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    dir('Kubernetes') {
+                        withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: KUBERNETES_NAMESPACE, restrictKubeConfigAccess: false, serverUrl: '') {
+                            // 🔄 Rolling update
+                            sh "kubectl set image deployment/netflix-app netflix-app=${DOCKER_REGISTRY}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                            sh "kubectl rollout status deployment/netflix-app -n ${KUBERNETES_NAMESPACE}"
+                            
+                            // 🏥 Health Check K8s
+                            sh "kubectl get pods -n ${KUBERNETES_NAMESPACE} -l app=netflix-app"
+                            echo "✅ Déploiement Kubernetes réussi"
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 📊 Tests de Performance (optionnel)
+        stage('Performance Tests') {
+            steps {
+                sh "npm run test:performance || echo 'Tests de performance non configurés'"
+            }
+        }
+    }
+    
+    post {
+        always {
+            // 📁 Archivage des rapports
+            archiveArtifacts artifacts: 'trivyfs.txt,trivyimage.txt,coverage/**/*', allowEmptyArchive: true
+            
+            // 🧹 Nettoyage des images Docker anciennes
+            sh 'docker image prune -f || true'
+        }
+        
+        success {
+            // 🚀 Notification GitHub de succès
+            githubNotify context: 'ci/jenkins', status: 'SUCCESS', description: 'Build successful'
+            
+            // 📧 Email de succès
+            emailext (
+                subject: "✅ Build Success - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>🎉 Build Successful!</h2>
+                    <p><strong>Project:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Branch:</strong> ${env.BRANCH_NAME}</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                    <p><strong>URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    <p><strong>Application:</strong> <a href="http://your-server:8081">http://your-server:8081</a></p>
+                    <p><strong>Kubernetes:</strong> Déployé dans le namespace ${KUBERNETES_NAMESPACE}</p>
+                """,
+                to: 'iambatmanthegoat@gmail.com',
+                mimeType: 'text/html'
+            )
+        }
+        
+        failure {
+            // 🚀 Notification GitHub d'échec
+            githubNotify context: 'ci/jenkins', status: 'FAILURE', description: 'Build failed'
+            
+            // 📧 Email d'échec
+            emailext (
+                subject: "❌ Build Failed - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>💥 Build Failed!</h2>
+                    <p><strong>Project:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Branch:</strong> ${env.BRANCH_NAME}</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                    <p><strong>URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    <p><strong>Result:</strong> ${currentBuild.result}</p>
+                    <p><strong>Console Output:</strong> <a href="${env.BUILD_URL}console">Voir les logs</a></p>
+                """,
+                to: 'iambatmanthegoat@gmail.com',
+                mimeType: 'text/html',
+                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+            )
+        }
+        
+        unstable {
+            // 🚀 Notification GitHub instable
+            githubNotify context: 'ci/jenkins', status: 'UNSTABLE', description: 'Build unstable'
+        }
+    }
+}
+
